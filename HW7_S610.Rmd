@@ -1,0 +1,183 @@
+---
+title: "HW7_S610"
+author: "Jongwook Kim"
+date: "11/17/2019"
+output: pdf_document
+---
+#1.Download the data from http://jfukuyama.github.io/teaching/stat610/assignments/ hw7.csv. The rows of the matrix are the samples, and the columns are variable measure- ments. You should have 50 samples and 10 variables.
+```{r}
+setwd("~/Dropbox/data")
+dat <- read.csv("hw7.csv")
+dat <- dat[,-1] #remove X column
+dat <- as.matrix(dat)
+```
+
+
+#2.Estimate the inverse covariance matrix using the graphical lasso.
+```{r}
+library(CVXR)
+library(ggplot2)
+
+e <- matrix((rep(1,nrow(dat))))
+px <- (diag(nrow(dat)) - e%*%t(e)/nrow(dat))%*%dat #centering dataset
+S <- (t(px)%*%px)/(nrow(px)-1)
+
+lambda_search <- 10^(seq(-1.5, 1.5, length.out = 40))
+
+get_theta_lasso <- function(lambda){
+  theta <- Variable(10,10)
+  objective <- Minimize(-log_det(theta) + matrix_trace(S%*%theta) + lambda*sum(abs(theta)))
+  problem <- Problem(objective)
+  result <- solve(problem)
+  return(result$getValue(theta))
+}
+#theta_hat <- plyr::alply(lambda_search, 1, get_theta_lasso)
+theta_hat2 <- plyr::aaply(lambda_search, 1, get_theta_lasso)
+```
+
+#3. Choose some subset of the elements of the inverse covariance and plot the estimates for a variety of values of $\lambda$.
+```{r}
+covar <- theta_hat2[,1,] #make each element as column to make the plot.
+for(i in 2:10){
+  covar <- cbind(covar,theta_hat2[,i,])
+}
+covar <- cbind(lambda=lambda_search, covar)
+
+theta_melted = reshape2::melt(data.frame(covar), id.vars = "lambda", value.name = "covariance")
+
+#Since covariance matrix is a 10 x 10 matrix, ggplot will have 100 lines.
+ggplot(theta_melted) +
+    geom_line(aes(x = lambda, y = covariance, color = variable, lty = variable)) +
+    scale_x_log10() + theme(legend.position = "none")
+```
+
+#4. We would like to pick a good value of $\lambda$: one way to do this is by cross validation. The idea is to choose the value of $\lambda$ that gives the highest value of the likelihood on a held-out portion of the data.
+
+```{r}
+#Randomly shuffle the data
+cv_dat <- dat[sample(nrow(dat)),]
+  
+#Create 10 equally size folds
+folds <- cut(seq(1,nrow(cv_dat)),breaks=10,labels=FALSE)
+
+get_theta_lasso_cv <- function(lambda){
+  nl <- 0 #the initial value of the negative log likelihood
+  #Perform 10 fold cross validation
+  for(i in 1:10){
+    #Segement the data by fold using the which() function 
+    testIndexes <- which(folds==i,arr.ind=TRUE)
+    test <- cv_dat[testIndexes, ]
+    train <- cv_dat[-testIndexes, ]
+         
+    e <- matrix((rep(1,nrow(train))))
+    px <- (diag(nrow(train)) - e%*%t(e)/nrow(train))%*%train #centering dataset
+    S_train <- (t(px)%*%px)/(nrow(px)-1)
+    
+    theta <- Variable(10,10)
+    objective <- Minimize(-log_det(theta) + matrix_trace(S_train%*%theta) + lambda*sum(abs(theta)))
+    problem <- Problem(objective)
+    result <- solve(problem)
+    theta_hat <- result$getValue(theta) #estimate of corvariance matrix
+    nl2 <- -log(det(theta_hat)) + sum(diag(S_train%*%theta_hat)) #negative log-likelihood
+    nl <- nl + nl2
+  }
+  return(nl)
+}
+
+#lambda_search <- 10^(seq(-1.5, 1.5, length.out = 40))
+n_like <- plyr::aaply(lambda_search, 1, get_theta_lasso_cv) #negative likelihoods with different lambdas
+
+like <- data.frame(lambda=lambda_search, negative_log_likelihood=n_like)
+like[which(like$negative_log_likelihood==min(like$negative_log_likelihood)),] #lambda achieving the maximum likelihood
+knitr::kable(like, align = 'c')
+
+
+lambda <- like[which(like$negative_log_likelihood==min(like$negative_log_likelihood)),1]
+result <- get_theta_lasso(lambda)
+round(result,2)#theta_hat by cv
+```
+
+
+#5. It turns out that in this dataset, the first variable is a measure of the abundance of a keystone predator, the second through 9th variables are measures of the abundances of prey species, and the last variable is is a measure of the abundance of a food source. Perform maximum likelihood estimation under the constraint that the partial correlations between the prey species are zero.
+
+```{r}
+theta <- Variable(10,10)
+objective <- Minimize(-log_det(theta) + matrix_trace(S%*%theta))
+constraints <- list(theta[2,3:9] == 0, theta[3,4:9] == 0, theta[3,4:9] == 0, theta[4,5:9] == 0, theta[5,6:9] == 0, theta[6,7:9] == 0, theta[7,8:9] == 0, theta[8,9] == 0)
+
+problem <- Problem(objective, constraints)
+result2 <- solve(problem)
+round(result2$getValue(theta), 2) #estimator of theta
+```
+
+#6. Obtain bootstrap confidence intervals for the non-zero elements of $\theta$: for some reasonably large number B, perform the following:
+
+```{r}
+bootstrap_ci = function(data, estimator, alpha, B) {
+    boot_estimates = get_boot_estimates(data, estimator, B)
+    boot_ci = get_ci(boot_estimates, alpha)
+    return(boot_ci)
+}
+get_ci = function(estimates, alpha) {
+    q_lo = alpha / 2
+    q_hi = 1 - (alpha / 2)
+    if(!is.null(dim(estimates))) {
+        ## if we have multi-dimensional estimates
+        cis = plyr::adply(estimates, c(1,2), function(x) quantile(x, probs = c(q_lo, q_hi)))
+    } else {
+        ## if we have one-dimensional estimates
+        cis = quantile(estimates, probs = c(q_lo, q_hi))
+    }
+    return(cis)
+}
+get_boot_estimates = function(data, estimator, B) {
+    boot_estimates = replicate(B, expr = {
+        resampled_data = get_bootstrap_sample(data)
+        boot_estimate = estimator(resampled_data)
+        return(boot_estimate)
+    })
+    return(boot_estimates)
+}
+get_bootstrap_sample = function(data) {
+    if(!is.null(dim(data))) {
+        boot_sample = bootstrap_sample_rows(data)
+    } else {
+        boot_sample =  bootstrap_sample_elements(data)
+    }
+    return(boot_sample)
+}
+bootstrap_sample_rows = function(data) {
+    n = nrow(data)
+    boot_idx = sample(1:n, size = n, replace = TRUE)
+    bootstrap_sample = data[boot_idx,]
+    return(bootstrap_sample)
+}
+bootstrap_sample_elements = function(data) {
+    n = length(data)
+    boot_idx = sample(1:n, size = n, replace = TRUE)
+    bootstrap_sample = data[boot_idx]
+    return(bootstrap_sample)
+}
+estimator <- function(data){ #estimator fn for the covariance matrix(theta)
+  e <- matrix((rep(1,nrow(data))))
+  px <- (diag(nrow(data)) - e%*%t(e)/nrow(dat))%*%data #centering dataset
+  S <- (t(px)%*%px)/(nrow(px)-1)
+  
+  theta <- Variable(10,10)
+  objective <- Minimize(-log_det(theta) + matrix_trace(S%*%theta))
+  constraints <- list(theta[2,3:9] == 0, theta[3,4:9] == 0, theta[3,4:9] == 0, theta[4,5:9] == 0, theta[5,6:9] == 0, theta[6,7:9] == 0, theta[7,8:9] == 0, theta[8,9] == 0)
+  
+  problem <- Problem(objective, constraints)
+  result2 <- solve(problem)
+  theta_hat <- result2$getValue(theta) #estimator of theta
+  #theta_ij <- matrix(theta_hat[which(round(theta_hat,5) != 0)],ncol=1) #extract only elements not zero
+  #return(theta_ij)
+  return(theta_hat)
+}
+
+CI <- bootstrap_ci(data = dat, estimator = estimator, alpha = .05, B = 100)
+CI$X1 <- as.numeric(CI$X1); CI$X2 <- as.numeric(CI$X2); 
+CI <- round(CI,4)
+CI[which(CI[,3] != 0),]
+```
+
